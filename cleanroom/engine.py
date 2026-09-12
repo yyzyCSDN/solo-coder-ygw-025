@@ -1,351 +1,183 @@
 from __future__ import annotations
-import csv, hashlib, io, json, random, sqlite3, threading, uuid
-from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Iterable
-from urllib.parse import parse_qs, urlparse
 
-def now() -> str:
+import json
+import sqlite3
+import threading
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from typing import Any, Iterator
+
+
+def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-def ident(prefix: str) -> str:
-    return prefix + "-" + uuid.uuid4().hex[:12]
 
-@dataclass
-class Entity:
-    id: str
-    name: str
-    state: str
-    priority: int = 50
-    quantity: float = 1.0
-    value: float = 0.0
-    owner: str = "system"
-    category: str = "default"
-    created_at: str = field(default_factory=now)
-    updated_at: str = field(default_factory=now)
-    version: int = 1
-    tags: list[str] = field(default_factory=list)
-    metadata: dict[str, Any] = field(default_factory=dict)
-    history: list[dict[str, Any]] = field(default_factory=list)
+class CleanroomError(Exception):
+    pass
 
-    def __post_init__(self) -> None:
-        self.name = str(self.name).strip()
-        if not self.name: raise ValueError("name is required")
-        self.priority = max(0, min(100, int(self.priority)))
-        self.quantity = max(0.0, float(self.quantity))
-        self.tags = sorted({str(x).strip().lower() for x in self.tags if str(x).strip()})
-        self.metadata, self.history = dict(self.metadata or {}), list(self.history or [])
 
-    @classmethod
-    def create(cls, prefix: str, name: str, state: str, **values: Any) -> "Entity":
-        return cls(ident(prefix), name, state, **values)
+class UnknownRoom(CleanroomError):
+    pass
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Entity":
-        fields = {"id","name","state","priority","quantity","value","owner","category",
-                  "created_at","updated_at","version","tags","metadata","history"}
-        return cls(**{key: data[key] for key in fields if key in data})
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+class InvalidStage(CleanroomError):
+    pass
 
-    def touch(self) -> None:
-        self.updated_at = now()
 
-    def transition(self, state: str, actor: str, reason: str = "") -> None:
-        old = self.state
-        self.state = state
-        self.version += 1
-        self.history.append({"at": now(), "from": old, "to": state, "actor": actor,
-                             "reason": reason, "version": self.version})
-        self.touch()
+class CleanroomStore:
+    """SQLite ledger for rooms, evidence, commands and staged safety work."""
 
-    def annotate(self, key: str, value: Any, actor: str = "system") -> None:
-        self.metadata[str(key)] = value
-        self.history.append({"at": now(), "annotation": str(key), "actor": actor})
-        self.version += 1
-        self.touch()
-
-    def add_tag(self, tag: str) -> None:
-        value = str(tag).strip().lower()
-        if value and value not in self.tags: self.tags.append(value); self.tags.sort(); self.touch()
-
-    def remove_tag(self, tag: str) -> None:
-        value = str(tag).strip().lower()
-        self.tags = [x for x in self.tags if x != value]; self.touch()
-
-    def age(self) -> float:
-        try: return max(0.0, (datetime.now(timezone.utc)-datetime.fromisoformat(self.created_at)).total_seconds())
-        except ValueError: return 0.0
-
-    def urgency(self) -> float:
-        extra = 20 if self.state in {"alarm","fault","blocked","exception","invalid"} else 0
-        return min(100.0, self.priority * .7 + min(30, self.age()/60) + extra)
-
-    def matches(self, text: str) -> bool:
-        return str(text).lower().strip() in json.dumps(self.to_dict(), ensure_ascii=False).lower()
-
-class DomainError(Exception): pass
-class NotFound(DomainError): pass
-class ValidationError(DomainError): pass
-class InvalidTransition(DomainError): pass
-
-class Events:
-    def __init__(self) -> None:
-        self.items: list[dict[str, Any]] = []
-        self.handlers: defaultdict[str, list[Callable[[dict[str,Any]],None]]] = defaultdict(list)
-        self.dead: list[dict[str, Any]] = []
-        self.sequence = 0
+    def __init__(self, database: str = ":memory:") -> None:
+        self.connection = sqlite3.connect(database, check_same_thread=False)
+        self.connection.row_factory = sqlite3.Row
         self.lock = threading.RLock()
+        with self.connection:
+            self.connection.executescript(
+                """
+                PRAGMA foreign_keys=ON;
+                CREATE TABLE IF NOT EXISTS rooms(
+                    room_id TEXT PRIMARY KEY, grade TEXT NOT NULL, state TEXT NOT NULL,
+                    supply_capacity REAL NOT NULL, exhaust_capacity REAL NOT NULL,
+                    config_version INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS pressure_edges(
+                    cleaner_room TEXT NOT NULL, dirtier_room TEXT NOT NULL,
+                    minimum_delta REAL NOT NULL,
+                    PRIMARY KEY(cleaner_room, dirtier_room));
+                CREATE TABLE IF NOT EXISTS evidence(
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    asset_id TEXT NOT NULL, signal TEXT NOT NULL, value REAL NOT NULL,
+                    quality TEXT NOT NULL, source TEXT NOT NULL,
+                    calibration_version TEXT NOT NULL, observed_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS commands(
+                    command_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    command_key TEXT UNIQUE NOT NULL, asset_id TEXT NOT NULL,
+                    kind TEXT NOT NULL, parameters TEXT NOT NULL,
+                    status TEXT NOT NULL, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS workflows(
+                    workflow_id TEXT PRIMARY KEY, kind TEXT NOT NULL,
+                    room_id TEXT NOT NULL, stage TEXT NOT NULL,
+                    revision INTEGER NOT NULL, payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(room_id) REFERENCES rooms(room_id));
+                CREATE TABLE IF NOT EXISTS incidents(
+                    incident_id TEXT PRIMARY KEY, origin_room TEXT NOT NULL,
+                    open INTEGER NOT NULL, affected_rooms TEXT NOT NULL,
+                    evidence_sequences TEXT NOT NULL, updated_at TEXT NOT NULL);
+                """
+            )
 
-    def subscribe(self, topic: str, handler: Callable[[dict[str,Any]],None]) -> None:
-        with self.lock:
-            if handler not in self.handlers[topic]: self.handlers[topic].append(handler)
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        with self.lock, self.connection:
+            yield self.connection
 
-    def publish(self, topic: str, kind: str, entity_id: str, payload: dict[str,Any]|None=None) -> dict[str,Any]:
-        with self.lock:
-            self.sequence += 1
-            event = {"sequence":self.sequence,"topic":topic,"kind":kind,"entity_id":entity_id,
-                     "payload":dict(payload or {}),"at":now()}
-            self.items.append(event); handlers=list(self.handlers[topic])+list(self.handlers["*"])
-        for handler in handlers:
-            try: handler(event)
-            except Exception as exc: self.dead.append({"event":event,"error":str(exc)})
-        return event
+    def configure_room(self, room_id: str, grade: str, *, supply_capacity: float, exhaust_capacity: float, config_version: int = 1) -> dict[str, Any]:
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT INTO rooms VALUES(?,?,?,?,?,?)
+                ON CONFLICT(room_id) DO UPDATE SET grade=excluded.grade,
+                supply_capacity=excluded.supply_capacity,
+                exhaust_capacity=excluded.exhaust_capacity,
+                config_version=excluded.config_version""",
+                (room_id, grade, "available", supply_capacity, exhaust_capacity, config_version),
+            )
+        return self.room(room_id)
 
-    def history(self, topic: str|None=None, kind: str|None=None) -> list[dict[str,Any]]:
-        return [x for x in self.items if (topic is None or x["topic"]==topic) and (kind is None or x["kind"]==kind)]
+    def room(self, room_id: str) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM rooms WHERE room_id=?", (room_id,)).fetchone()
+        if row is None:
+            raise UnknownRoom(room_id)
+        return dict(row)
 
-    def replay(self, events: Iterable[dict[str,Any]], handler: Callable[[dict[str,Any]],None]) -> int:
-        count=0
-        for event in events: handler(event); count+=1
-        return count
+    def rooms(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM rooms ORDER BY room_id")]
 
-    def statistics(self) -> dict[str,Any]:
-        return {"total":len(self.items),"by_kind":dict(Counter(x["kind"] for x in self.items)),
-                "dead_letters":len(self.dead)}
+    def set_room_state(self, room_id: str, state: str) -> dict[str, Any]:
+        self.room(room_id)
+        with self.transaction() as conn:
+            conn.execute("UPDATE rooms SET state=? WHERE room_id=?", (state, room_id))
+        return self.room(room_id)
 
-    def clear(self) -> None:
-        self.items.clear(); self.dead.clear(); self.sequence=0
+    def connect_pressure(self, cleaner_room: str, dirtier_room: str, minimum_delta: float) -> None:
+        self.room(cleaner_room)
+        self.room(dirtier_room)
+        with self.transaction() as conn:
+            conn.execute("INSERT OR REPLACE INTO pressure_edges VALUES(?,?,?)", (cleaner_room, dirtier_room, float(minimum_delta)))
 
-class Metrics:
-    def __init__(self) -> None:
-        self.counters: defaultdict[str,float] = defaultdict(float)
-        self.samples: defaultdict[str,list[float]] = defaultdict(list)
+    def pressure_edges(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.connection.execute("SELECT * FROM pressure_edges")]
 
-    def inc(self, name: str, amount: float=1.0, **labels: str) -> float:
-        key=name+"|"+",".join(f"{k}={v}" for k,v in sorted(labels.items()))
-        self.counters[key]+=amount; self.samples[name].append(self.counters[key]); return self.counters[key]
+    def record_evidence(self, asset_id: str, signal: str, value: float, *, source: str, quality: str = "good", calibration_version: str = "v1", observed_at: str | None = None) -> dict[str, Any]:
+        stamp = observed_at or utc_now()
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """INSERT INTO evidence(asset_id,signal,value,quality,source,
+                calibration_version,observed_at) VALUES(?,?,?,?,?,?,?)""",
+                (asset_id, signal, float(value), quality, source, calibration_version, stamp),
+            )
+        return dict(self.connection.execute("SELECT * FROM evidence WHERE sequence=?", (cursor.lastrowid,)).fetchone())
 
-    def observe(self, name: str, value: float) -> None:
-        self.samples[name].append(float(value))
+    def evidence(self, asset_id: str, signal: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM evidence WHERE asset_id=? AND signal=? ORDER BY sequence", (asset_id, signal)
+        ).fetchall()
+        return [dict(row) for row in rows]
 
-    def summary(self, name: str|None=None) -> dict[str,Any]:
-        values=[v for key,seq in self.samples.items() if name is None or key==name for v in seq]
-        if not values: return {"count":0,"mean":0.0,"min":0.0,"max":0.0}
-        return {"count":len(values),"mean":round(sum(values)/len(values),3),"min":min(values),"max":max(values)}
-
-    def export(self) -> dict[str,Any]:
-        return {"counters":dict(self.counters),"samples":{key:self.summary(key) for key in self.samples}}
-
-class Store:
-    def __init__(self, path: str=":memory:") -> None:
-        self.conn=sqlite3.connect(path,check_same_thread=False); self.conn.row_factory=sqlite3.Row
-        self.lock=threading.RLock()
-        with self.conn:
-            self.conn.execute("CREATE TABLE IF NOT EXISTS entities(id TEXT PRIMARY KEY,state TEXT,category TEXT,priority INTEGER,payload TEXT,created_at TEXT,updated_at TEXT)")
-            self.conn.execute("CREATE INDEX IF NOT EXISTS state_idx ON entities(state)")
-            self.conn.execute("CREATE INDEX IF NOT EXISTS priority_idx ON entities(priority)")
-
-    def save(self, entity: Entity) -> Entity:
-        payload=json.dumps(entity.to_dict(),ensure_ascii=False,sort_keys=True)
-        with self.lock,self.conn:
-            self.conn.execute("""INSERT INTO entities VALUES(?,?,?,?,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET state=excluded.state,category=excluded.category,
-                priority=excluded.priority,payload=excluded.payload,updated_at=excluded.updated_at""",
-                (entity.id,entity.state,entity.category,entity.priority,payload,entity.created_at,entity.updated_at))
-        return entity
-
-    def get(self, entity_id: str) -> Entity|None:
-        row=self.conn.execute("SELECT payload FROM entities WHERE id=?",(entity_id,)).fetchone()
-        return Entity.from_dict(json.loads(row["payload"])) if row else None
-
-    def list(self, state: str|None=None, category: str|None=None, minimum_priority: int|None=None,
-             limit: int=5000, offset: int=0) -> list[Entity]:
-        clauses=[]; values=[]
-        if state is not None: clauses.append("state=?"); values.append(state)
-        if category is not None: clauses.append("category=?"); values.append(category)
-        if minimum_priority is not None: clauses.append("priority>=?"); values.append(minimum_priority)
-        where=" WHERE "+" AND ".join(clauses) if clauses else ""
-        values += [max(1,min(5000,limit)),max(0,offset)]
-        rows=self.conn.execute("SELECT payload FROM entities"+where+" ORDER BY priority DESC,updated_at DESC LIMIT ? OFFSET ?",values).fetchall()
-        return [Entity.from_dict(json.loads(row["payload"])) for row in rows]
-
-    def count(self) -> int:
-        return int(self.conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0])
-
-    def delete(self, entity_id: str) -> bool:
-        with self.lock,self.conn:
-            return self.conn.execute("DELETE FROM entities WHERE id=?",(entity_id,)).rowcount>0
-
-    def snapshot(self) -> list[dict[str,Any]]: return [x.to_dict() for x in self.list()]
-    def restore(self, values: Iterable[dict[str,Any]]) -> int:
-        count=0
-        for value in values: self.save(Entity.from_dict(value)); count+=1
-        return count
-    def close(self) -> None: self.conn.close()
-
-class Planner:
-    def __init__(self) -> None:
-        self.slots=[]; self.sequence=0
-
-    def build(self, entities: Iterable[Entity]) -> list[dict[str,Any]]:
-        self.slots=[]; ends={"primary":0,"secondary":0}
-        for entity in sorted(entities,key=lambda x:(x.urgency(),x.priority),reverse=True):
-            lane=min(ends,key=ends.get); self.sequence+=1
-            duration=max(5,min(180,5+int(entity.quantity*3)+(100-entity.priority)//8))
-            slot={"id":f"slot-{self.sequence:04d}","entity_id":entity.id,"resource":lane,
-                  "start":ends[lane],"duration":duration,"score":round(entity.urgency(),2),"status":"proposed"}
-            self.slots.append(slot); ends[lane]+=duration
-        return list(self.slots)
-
-    def conflicts(self) -> list[tuple[str,str]]:
-        result=[]
-        for left in self.slots:
-            for right in self.slots:
-                if left["id"]>=right["id"] or left["resource"]!=right["resource"]: continue
-                if left["start"]<right["start"]+right["duration"] and right["start"]<left["start"]+left["duration"]:
-                    result.append((left["id"],right["id"]))
+    def command_once(self, command_key: str, asset_id: str, kind: str, **parameters: Any) -> dict[str, Any]:
+        existing = self.connection.execute("SELECT * FROM commands WHERE command_key=?", (command_key,)).fetchone()
+        if existing is not None:
+            result = dict(existing)
+            result["parameters"] = json.loads(result["parameters"])
+            result["duplicate"] = True
+            return result
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                "INSERT INTO commands(command_key,asset_id,kind,parameters,status,created_at) VALUES(?,?,?,?,?,?)",
+                (command_key, asset_id, kind, json.dumps(parameters, sort_keys=True), "requested", utc_now()),
+            )
+        result = dict(self.connection.execute("SELECT * FROM commands WHERE command_id=?", (cursor.lastrowid,)).fetchone())
+        result["parameters"] = json.loads(result["parameters"])
+        result["duplicate"] = False
         return result
 
-    def summary(self) -> dict[str,Any]:
-        return {"total":len(self.slots),"statuses":dict(Counter(x["status"] for x in self.slots)),
-                "conflicts":len(self.conflicts())}
+    def put_workflow(self, workflow_id: str, kind: str, room_id: str, stage: str, payload: dict[str, Any]) -> dict[str, Any]:
+        self.room(room_id)
+        current = self.connection.execute("SELECT revision FROM workflows WHERE workflow_id=?", (workflow_id,)).fetchone()
+        revision = int(current["revision"]) + 1 if current else 1
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT INTO workflows VALUES(?,?,?,?,?,?,?)
+                ON CONFLICT(workflow_id) DO UPDATE SET stage=excluded.stage,
+                revision=excluded.revision,payload=excluded.payload,updated_at=excluded.updated_at""",
+                (workflow_id, kind, room_id, stage, revision, json.dumps(payload, sort_keys=True), utc_now()),
+            )
+        return self.workflow(workflow_id)
 
-class Engine:
-    STATES=["sealed","preparing","running","disinfecting","released","alarm"]
-    DEFAULT_STATE="sealed"
-    DOMAIN="operating-room air quality and environmental interlocks"
+    def workflow(self, workflow_id: str) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM workflows WHERE workflow_id=?", (workflow_id,)).fetchone()
+        if row is None:
+            raise InvalidStage(f"unknown workflow: {workflow_id}")
+        result = dict(row)
+        result["payload"] = json.loads(result["payload"])
+        return result
 
-    def __init__(self, database: str=":memory:") -> None:
-        self.store=Store(database); self.events=Events(); self.metrics=Metrics(); self.planner=Planner()
-        self.random=random.Random(19); self.events.subscribe("domain",self._metric)
+    def save_incident(self, incident_id: str, origin_room: str, affected: list[str], sequences: list[int]) -> dict[str, Any]:
+        with self.transaction() as conn:
+            conn.execute(
+                """INSERT INTO incidents VALUES(?,?,?,?,?,?)
+                ON CONFLICT(incident_id) DO UPDATE SET affected_rooms=excluded.affected_rooms,
+                evidence_sequences=excluded.evidence_sequences,updated_at=excluded.updated_at""",
+                (incident_id, origin_room, 1, json.dumps(sorted(set(affected))), json.dumps(sequences), utc_now()),
+            )
+        row = self.connection.execute("SELECT * FROM incidents WHERE incident_id=?", (incident_id,)).fetchone()
+        result = dict(row)
+        result["affected_rooms"] = json.loads(result["affected_rooms"])
+        result["evidence_sequences"] = json.loads(result["evidence_sequences"])
+        return result
 
-    def _metric(self,event: dict[str,Any]) -> None: self.metrics.inc("events",kind=event["kind"])
+    def snapshot(self) -> dict[str, Any]:
+        tables = ("rooms", "pressure_edges", "evidence", "commands", "workflows", "incidents")
+        return {name: [dict(row) for row in self.connection.execute(f"SELECT * FROM {name}")] for name in tables}
 
-    def validate(self, entity: Entity) -> None:
-        if entity.state not in self.STATES: raise ValidationError("unknown state")
-        if not entity.name or not 0<=entity.priority<=100: raise ValidationError("invalid entity")
-
-    def create(self,name: str,**values: Any) -> Entity:
-        entity=Entity.create("cleanroom",name,values.pop("state",self.DEFAULT_STATE),**values)
-        self.validate(entity); self.store.save(entity)
-        self.events.publish("domain","created",entity.id,{"state":entity.state}); self.metrics.inc("created")
-        return entity
-
-    def get(self,entity_id: str) -> Entity:
-        entity=self.store.get(entity_id)
-        if entity is None: raise NotFound(entity_id)
-        return entity
-
-    def entities(self,**filters: Any) -> list[Entity]: return self.store.list(**filters)
-
-    def list_entities(self,page: int=1,size: int=50,**filters: Any) -> dict[str,Any]:
-        page=max(1,int(page)); size=max(1,min(500,int(size)))
-        return {"page":page,"size":size,"total":self.store.count(),
-                "items":[x.to_dict() for x in self.store.list(limit=size,offset=(page-1)*size,**filters)]}
-
-    def search(self,text: str) -> list[dict[str,Any]]:
-        return [x.to_dict() for x in self.store.list() if x.matches(text)]
-
-    def transition(self,entity_id: str,next_state: str,actor: str="system",reason: str="") -> Entity:
-        entity=self.get(entity_id)
-        index=self.STATES.index(entity.state) if entity.state in self.STATES else -1
-        allowed={self.STATES[min(index+1,len(self.STATES)-1)],"alarm","fault","blocked","exception","rejected","cancelled"}
-        if next_state not in self.STATES or next_state not in allowed: raise InvalidTransition(f"{entity.state}->{next_state}")
-        entity.transition(next_state,actor,reason); self.store.save(entity)
-        self.events.publish("domain","transitioned",entity.id,{"state":next_state,"actor":actor})
-        self.metrics.inc("transitions",state=next_state); return entity
-
-    def annotate(self,entity_id: str,key: str,value: Any,actor: str="system") -> Entity:
-        entity=self.get(entity_id); entity.annotate(key,value,actor); self.store.save(entity)
-        self.events.publish("domain","annotated",entity.id,{"key":key}); return entity
-
-    def evaluate(self,entity_id: str,context: dict[str,Any]|None=None) -> dict[str,Any]:
-        entity=self.get(entity_id); context=context or {}; reasons=[]; actions=[]
-        if entity.priority>=80: reasons.append("high-priority"); actions.append("expedite")
-        if context.get("maintenance"): reasons.append("maintenance"); actions.append("hold")
-        if context.get("capacity",float("inf"))<entity.quantity: reasons.append("capacity"); actions.append("reschedule")
-        return {"allowed":"capacity" not in reasons,"score":round(entity.urgency(),2),"reasons":reasons,"actions":actions}
-
-    def build_plan(self) -> dict[str,Any]:
-        slots=self.planner.build(self.entities()); self.metrics.observe("plan_size",len(slots))
-        self.events.publish("domain","plan-built","planner",{"slots":len(slots)})
-        return {"slots":slots,"conflicts":self.planner.conflicts(),"summary":self.planner.summary()}
-
-    def dashboard(self) -> dict[str,Any]:
-        rows=self.entities(); states=Counter(x.state for x in rows)
-        risks=[{"id":x.id,"name":x.name,"risk":round(x.urgency(),2)} for x in rows if x.urgency()>=60]
-        return {"domain":self.DOMAIN,"total":len(rows),"states":dict(states),
-                "categories":dict(Counter(x.category for x in rows)),
-                "risks":sorted(risks,key=lambda x:x["risk"],reverse=True),"plan":self.planner.summary()}
-
-    def health(self) -> dict[str,Any]:
-        return {"status":"ok","domain":self.DOMAIN,"entities":self.store.count(),
-                "events":self.events.statistics(),"metrics":self.metrics.summary()}
-
-    def simulate(self,count: int=5) -> dict[str,Any]:
-        ids=[]
-        for index in range(max(0,count)):
-            entity=self.create(f"sim-{index+1:03d}",priority=self.random.randint(20,98),
-                quantity=round(self.random.uniform(1,20),2),value=round(self.random.uniform(10,1000),2),
-                owner="simulator",category="simulation",tags=["generated"],
-                metadata={"signal":round(self.random.random(),4)})
-            ids.append(entity.id)
-        return {"created":len(ids),"ids":ids,"dashboard":self.dashboard()}
-
-    def export_csv(self) -> str:
-        out=io.StringIO(); fields=["id","name","state","priority","quantity","value","owner","category","updated_at"]
-        writer=csv.DictWriter(out,fieldnames=fields); writer.writeheader()
-        for entity in self.entities(): writer.writerow({key:getattr(entity,key) for key in fields})
-        return out.getvalue()
-
-    def snapshot(self) -> dict[str,Any]:
-        return {"domain":self.DOMAIN,"entities":self.store.snapshot(),"events":self.events.history(),"metrics":self.metrics.export()}
-
-    def restore(self,snapshot: dict[str,Any]) -> int:
-        count=self.store.restore(snapshot.get("entities",[])); self.metrics.inc("restored"); return count
-    def close(self) -> None: self.store.close()
-
-def serve(engine: Engine,host: str="127.0.0.1",port: int=8080) -> ThreadingHTTPServer:
-    class Handler(BaseHTTPRequestHandler):
-        def send_json(self,status: int,payload: Any) -> None:
-            raw=json.dumps(payload,ensure_ascii=False,default=str).encode()
-            self.send_response(status); self.send_header("Content-Type","application/json"); self.send_header("Content-Length",str(len(raw))); self.end_headers(); self.wfile.write(raw)
-        def do_GET(self) -> None:
-            parsed=urlparse(self.path); query=parse_qs(parsed.query)
-            try:
-                if parsed.path=="/health": body=engine.health()
-                elif parsed.path=="/dashboard": body=engine.dashboard()
-                elif parsed.path=="/metrics": body=engine.metrics.export()
-                elif parsed.path=="/events": body={"events":engine.events.history()}
-                elif parsed.path=="/entities": body=engine.list_entities(state=query.get("state",[None])[0])
-                else: self.send_json(404,{"error":"not_found"}); return
-                self.send_json(200,body)
-            except Exception as exc: self.send_json(400,{"error":type(exc).__name__,"message":str(exc)})
-        def do_POST(self) -> None:
-            length=int(self.headers.get("Content-Length","0")); body=json.loads(self.rfile.read(length) or b"{}")
-            try:
-                if self.path=="/entities": result=engine.create(**body).to_dict()
-                elif self.path=="/plan": result=engine.build_plan()
-                elif self.path=="/simulate": result=engine.simulate(int(body.get("count",5)))
-                else: self.send_json(404,{"error":"not_found"}); return
-                self.send_json(201,result)
-            except Exception as exc: self.send_json(400,{"error":type(exc).__name__,"message":str(exc)})
-        def log_message(self,*args: Any) -> None: return
-    return ThreadingHTTPServer((host,port),Handler)
-
-
-
+    def close(self) -> None:
+        self.connection.close()

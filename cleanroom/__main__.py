@@ -1,23 +1,23 @@
 from __future__ import annotations
-import argparse, json
-from .service import CleanroomService, demo
+
+import argparse
+import json
+
+from .service import CleanroomService
+
+
 def main() -> None:
-    parser=argparse.ArgumentParser(description="Cleanroom OR Control")
-    parser.add_argument("--demo",action="store_true"); parser.add_argument("--serve",action="store_true")
-    parser.add_argument("--db",default="runtime.db"); parser.add_argument("--port",type=int,default=8080)
-    args=parser.parse_args()
-    if args.demo: demo(); return
-    service=CleanroomService(args.db)
-    if args.serve:
-        from .engine import serve
-        server=serve(service,port=args.port)
-        print(f"cleanroom listening on {args.port}")
-        try: server.serve_forever()
-        except KeyboardInterrupt: pass
-        finally: server.server_close()
-    else: print(json.dumps(service.health(),ensure_ascii=False,indent=2))
-    service.close()
-if __name__=="__main__": main()
+    parser = argparse.ArgumentParser(description="Inspect a cleanroom control ledger")
+    parser.add_argument("--db", default="cleanroom.db")
+    parser.add_argument("--demo", action="store_true")
+    args = parser.parse_args()
+    service = CleanroomService(args.db)
+    try:
+        result = service.commission_pressure("demo-cycle", {"or-a": 15, "buffer-a": 10, "corridor": 7}) if args.demo else service.health()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    finally:
+        service.close()
 
 
-
+if __name__ == "__main__":
+    main()
